@@ -24,6 +24,7 @@ public typealias VoiceActivityDetectCallback = ([Float]) async -> Bool
 /// Responsible for streaming audio from the microphone, processing it, and transcribing it in real-time.
 public actor AudioStreamTranscriber {
     private let vadWindowSeconds: Double = 0.1
+    private var accumulatedSilenceSeconds: Float = 0
     private var state: AudioStreamTranscriber.State = .init() {
         didSet {
             stateChangeCallback?(oldValue, state)
@@ -162,12 +163,10 @@ public actor AudioStreamTranscriber {
        
        
         if useVAD {
+            
             var voiceDetected = false
             if let callback = isVoiceDetectedCallback {
-             //  print("callback called: \(nextBufferSize)")
                 let chunk = Array(currentBuffer.suffix(Int(Double(WhisperKit.sampleRate) * vadWindowSeconds)))
-             //   print("chunk: \(chunk.count)")
-            //    debugAudioLevel(chunk)
                 voiceDetected = await callback(chunk)
             } else {
                 voiceDetected = AudioProcessor.isVoiceDetected(
@@ -184,18 +183,17 @@ public actor AudioStreamTranscriber {
             // Only run the transcribe if the next buffer has voice
             if !voiceDetected {
                 Logging.debug("No voice detected, skipping transcribe")
-                print("No voice detected, skipping transcribe: \(nextBufferSeconds)")
-                if nextBufferSeconds > 1.5, !state.unconfirmedSegments.isEmpty {
-               //     print("No voice detected, promote unconfirmed segments: \(nextBufferSeconds)")
+            //    print("No voice detected, skipping transcribe: \(nextBufferSeconds)")
+                accumulatedSilenceSeconds += Float(vadWindowSeconds)
+                if accumulatedSilenceSeconds > 0.5, !state.unconfirmedSegments.isEmpty {
+                    print("No voice detected, promote unconfirmed segments: \(nextBufferSeconds)")
                     
                     let snapshot = Array(audioProcessor.audioSamples)
                     let transcription = try await transcribeAudioSamples(snapshot)
                     let segments = transcription.segments
                     if !segments.isEmpty {
-              //          print("promoted current \(segments.count) segments. first text: \(segments.first?.text)")
                         state.confirmedSegments.append(contentsOf: segments)
                     } else{
-               //         print("promoted old \(state.unconfirmedSegments.count) segments. first text: \(state.unconfirmedSegments.first?.text)")
                         state.confirmedSegments.append(contentsOf: state.unconfirmedSegments)
                     }
                     state.lastConfirmedSegmentEndSeconds = 0
@@ -204,30 +202,23 @@ public actor AudioStreamTranscriber {
                     state.lastBufferSize = 0
                     
                     state.unconfirmedSegments = []
+                    accumulatedSilenceSeconds = 0
                 }
                 
                 if state.currentText == "" {
                     state.currentText = "Waiting for speech..."
                 }
-           //     print("sleep !!!!")
-                // Sleep for 100ms and check the next buffer
+           
                 return try await Task.sleep(nanoseconds: 100_000_000)
+            } else {
+                accumulatedSilenceSeconds = 0
             }
         }
 
         // Run transcribe
         state.lastBufferSize = currentBuffer.count
-       
-        let transcription = try await transcribeAudioSamples(Array(currentBuffer))
-    //   print("-------------------------------------------------------")
-        transcription.segments.forEach{ seg in
-            
-            print("transcribed ====>\(seg.text)")
-            print(" ")
-        }
-      
         
-
+        let transcription = try await transcribeAudioSamples(Array(currentBuffer))
         state.currentText = ""
         state.unconfirmedText = []
         let segments = transcription.segments
@@ -253,15 +244,10 @@ public actor AudioStreamTranscriber {
 
             // Update transcriptions to reflect the remaining segments
             state.unconfirmedSegments = remainingSegments
-            for left in confirmedSegmentsArray{
-                print("confirmed ====>\(left.text)")
-            }
         } else {
             // Handle the case where segments are fewer or equal to required
             state.unconfirmedSegments = segments
         }
-        print("-------------------------------------------------------")
-        print(" ")
     }
 
     private func transcribeAudioSamples(_ samples: [Float]) async throws -> TranscriptionResult {
